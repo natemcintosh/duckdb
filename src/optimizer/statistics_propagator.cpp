@@ -11,6 +11,7 @@
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
 #include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -89,6 +90,9 @@ unique_ptr<NodeStatistics> StatisticsPropagator::PropagateStatistics(LogicalOper
 		break;
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
 		result = PropagateStatistics(node.Cast<LogicalMaterializedCTE>(), node_ptr);
+		break;
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+		result = PropagateStatistics(node.Cast<LogicalDistinct>(), node_ptr);
 		break;
 	case LogicalOperatorType::LOGICAL_FILTER:
 		result = PropagateStatistics(node.Cast<LogicalFilter>(), node_ptr);

@@ -6,6 +6,7 @@
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/operator/add.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
@@ -16,6 +17,8 @@
 #include "duckdb/optimizer/statistics_propagator.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_column_data_get.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
@@ -123,35 +126,38 @@ bool TryGetMinMaxColumnInfo(const Expression &expr, MinMaxColumnInfo &info) {
 	return true;
 }
 
-bool TryGetValueFromStats(Context &context, const PartitionStatistics &stats, const StorageIndex &storage_index,
-                          const ValueComparator &comparator, const LogicalType &result_type, Value &result) {
+//! The statistics of a column in a partition - only if their min/max are the exact bounds of its values
+unique_ptr<BaseStatistics> GetExactMinMaxStats(const PartitionStatistics &stats, const StorageIndex &storage_index) {
 	if (!stats.partition_row_group) {
-		return false;
+		return nullptr;
 	}
 	auto column_stats = stats.partition_row_group->GetColumnStatistics(storage_index);
 	if (!column_stats) {
-		return false;
+		return nullptr;
 	}
 	if (!stats.partition_row_group->MinMaxIsExact(storage_index) || stats.partition_row_group->HasPendingWrites()) {
-		return false;
+		return nullptr;
 	}
 	if (column_stats->GetStatsType() == StatisticsType::NUMERIC_STATS) {
 		if (!NumericStats::HasMinMax(*column_stats)) {
 			// TODO: This also returns if an entire row group is null. In that case, we could skip/compare null
-			return false;
+			return nullptr;
 		}
 	} else {
 		D_ASSERT(column_stats->GetStatsType() == StatisticsType::STRING_STATS);
 		if (!StringStats::HasMinMax(*column_stats)) {
-			return false;
+			return nullptr;
 		}
 		if (StringStats::GetMinType(*column_stats) != StringStatsType::EXACT_STATS ||
 		    StringStats::GetMaxType(*column_stats) != StringStatsType::EXACT_STATS) {
 			// string stats are not exact - we cannot use the value from the stats
-			return false;
+			return nullptr;
 		}
 	}
-	result = comparator.GetVal(*column_stats);
+	return column_stats;
+}
+
+bool TryCastStatsValue(Context &context, const LogicalType &result_type, Value &result) {
 	if (result.type() == result_type) {
 		return true;
 	}
@@ -161,6 +167,50 @@ bool TryGetValueFromStats(Context &context, const PartitionStatistics &stats, co
 	}
 	result = std::move(*cast);
 	return true;
+}
+
+bool TryGetValueFromStats(Context &context, const PartitionStatistics &stats, const StorageIndex &storage_index,
+                          const ValueComparator &comparator, const LogicalType &result_type, Value &result) {
+	auto column_stats = GetExactMinMaxStats(stats, storage_index);
+	if (!column_stats) {
+		return false;
+	}
+	result = comparator.GetVal(*column_stats);
+	return TryCastStatsValue(context, result_type, result);
+}
+
+//! The single value all rows of a partition have in a column - if the statistics prove there is one
+bool TryGetConstantFromStats(Context &context, const PartitionStatistics &stats, const StorageIndex &storage_index,
+                             const LogicalType &result_type, Value &result) {
+	auto column_stats = GetExactMinMaxStats(stats, storage_index);
+	if (!column_stats || column_stats->CanHaveNull()) {
+		return false;
+	}
+	Value max;
+	if (column_stats->GetStatsType() == StatisticsType::NUMERIC_STATS) {
+		result = NumericStats::Min(*column_stats);
+		max = NumericStats::Max(*column_stats);
+	} else {
+		result = StringStats::Min(*column_stats);
+		max = StringStats::Max(*column_stats);
+	}
+	if (result != max) {
+		return false;
+	}
+	return TryCastStatsValue(context, result_type, result);
+}
+
+bool HasMinMaxStats(const LogicalType &type) {
+	return type == LogicalType::VARCHAR || type.IsNumeric() || type.IsTemporal();
+}
+
+bool AnyVolatile(const vector<unique_ptr<Expression>> &expressions) {
+	for (auto &expr : expressions) {
+		if (expr->IsVolatile()) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool GroupingSetCanIntroduceNull(const LogicalAggregate &aggr, idx_t group_idx) {
@@ -619,6 +669,102 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 	node_ptr = std::move(expression_get);
 }
 
+void StatisticsPropagator::TryScanConstantPartitions(const vector<unique_ptr<Expression>> &distinct_expressions,
+                                                     unique_ptr<LogicalOperator> &child) {
+	if (AnyVolatile(distinct_expressions)) {
+		return;
+	}
+	// skip any projections
+	reference<unique_ptr<LogicalOperator>> node_ref = child;
+	while (node_ref.get()->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		if (AnyVolatile(node_ref.get()->expressions)) {
+			return;
+		}
+		node_ref = node_ref.get()->children[0];
+	}
+	if (node_ref.get()->type != LogicalOperatorType::LOGICAL_GET) {
+		return;
+	}
+	auto &get = node_ref.get()->Cast<LogicalGet>();
+	if (!get.function.get_partition_stats || !get.children.empty() || get.GetColumnIds().empty()) {
+		return;
+	}
+	if (get.extra_info.sample_options || get.table_filters.HasFilters()) {
+		// only use partition statistics if we query the whole table
+		return;
+	}
+
+	vector<LogicalType> types;
+	vector<StorageIndex> storage_indexes;
+	for (auto &binding : get.GetColumnBindings()) {
+		if (binding.column_index.GetIndex() != types.size()) {
+			// the scan that replaces this one emits all of its columns in order
+			return;
+		}
+		auto &column_index = get.GetColumnIndex(binding);
+		auto &type = get.GetColumnType(column_index);
+		if (!HasMinMaxStats(type) || type.IsFloating()) {
+			// the min/max of floating point statistics do not cover NaN
+			return;
+		}
+		StorageIndex storage_index;
+		if (!get.TryGetStorageIndex(column_index, storage_index)) {
+			return;
+		}
+		types.push_back(type);
+		storage_indexes.push_back(std::move(storage_index));
+	}
+
+	GetPartitionStatsInput input(get.function, get.bind_data.get());
+	auto partition_stats = get.function.get_partition_stats(context, input);
+
+	auto collection = make_uniq<ColumnDataCollection>(context, types);
+	DataChunk chunk;
+	chunk.Initialize(context, types);
+	for (auto &stats : partition_stats) {
+		if (stats.count_type != CountType::COUNT_EXACT) {
+			// we cannot tell whether the partition has any rows
+			return;
+		}
+		if (stats.count == 0) {
+			continue;
+		}
+		if (chunk.size() == STANDARD_VECTOR_SIZE) {
+			collection->Append(chunk);
+			chunk.Reset();
+		}
+		for (idx_t col_idx = 0; col_idx < types.size(); col_idx++) {
+			Value constant;
+			if (!TryGetConstantFromStats(context.GetContext(), stats, storage_indexes[col_idx], types[col_idx],
+			                             constant)) {
+				return;
+			}
+			chunk.data[col_idx].Append(constant);
+		}
+	}
+	collection->Append(chunk);
+	const auto row_count = collection->Count();
+	if (row_count == 0) {
+		return;
+	}
+	node_ref.get() = make_uniq<LogicalColumnDataGet>(get.table_index, std::move(types), std::move(collection));
+	for (reference<LogicalOperator> op = *child;; op = *op.get().children[0]) {
+		op.get().SetEstimatedCardinality(row_count);
+		if (op.get().children.empty()) {
+			break;
+		}
+	}
+}
+
+unique_ptr<NodeStatistics> StatisticsPropagator::PropagateStatistics(LogicalDistinct &distinct,
+                                                                     unique_ptr<LogicalOperator> &node_ptr) {
+	auto stats = PropagateChildren(distinct, node_ptr);
+	if (distinct.distinct_type == DistinctType::DISTINCT) {
+		TryScanConstantPartitions(distinct.distinct_targets, distinct.children[0]);
+	}
+	return stats;
+}
+
 unique_ptr<NodeStatistics> StatisticsPropagator::PropagateStatistics(LogicalAggregate &aggr,
                                                                      unique_ptr<LogicalOperator> &node_ptr) {
 	// first propagate statistics in the child node
@@ -687,6 +833,10 @@ unique_ptr<NodeStatistics> StatisticsPropagator::PropagateStatistics(LogicalAggr
 
 	const auto is_ungrouped = aggr.groups.empty();
 	const auto grouping_set_count = MaxValue<idx_t>(1, aggr.grouping_sets.size());
+	if (aggr.expressions.empty()) {
+		// without aggregates the result only depends on the distinct rows of the input
+		TryScanConstantPartitions(aggr.groups, aggr.children[0]);
+	}
 	// after we propagate statistics - try to directly execute aggregates using statistics
 	TryExecuteAggregates(aggr, node_ptr);
 

@@ -1,0 +1,276 @@
+# name: test/sql/optimizer/distinct_constant_partitions.test
+# description: DISTINCT over columns that are constant within every partition is answered from partition statistics
+# group: [optimizer]
+
+require parquet
+
+statement ok
+ATTACH '{TEST_DIR}/distinct_constant_partitions.duckdb' AS db (ROW_GROUP_SIZE 2048);
+
+statement ok
+USE db;
+
+# 5 row groups of 2048 rows: i, s and d are constant within a row group, x and f are not / are floating point
+statement ok
+CREATE TABLE t AS
+SELECT (range // 2048 % 3)::INTEGER AS i,
+       'm' || (range // 2048 % 3) AS s,
+       DATE '2026-01-01' + (range // 4096)::INTEGER AS d,
+       range AS x,
+       (range // 2048)::DOUBLE AS f
+FROM range(10240);
+
+statement ok
+CHECKPOINT;
+
+query II
+EXPLAIN SELECT DISTINCT i, s, d FROM t;
+----
+physical_plan	<REGEX>:.*Column Data Scan.*
+
+query III
+SELECT DISTINCT i, s, d FROM t ORDER BY ALL;
+----
+0	m0	2026-01-01
+0	m0	2026-01-02
+1	m1	2026-01-01
+1	m1	2026-01-03
+2	m2	2026-01-02
+
+query II
+EXPLAIN SELECT i, s FROM t GROUP BY ALL;
+----
+physical_plan	<REGEX>:.*Column Data Scan.*
+
+query II
+SELECT i, s FROM t GROUP BY ALL ORDER BY ALL;
+----
+0	m0
+1	m1
+2	m2
+
+# expressions over the constant columns
+query II
+EXPLAIN SELECT DISTINCT upper(s), i + 1 FROM t;
+----
+physical_plan	<REGEX>:.*Column Data Scan.*
+
+query II
+SELECT DISTINCT upper(s), i + 1 FROM t ORDER BY ALL;
+----
+M0	1
+M1	2
+M2	3
+
+query II
+EXPLAIN SELECT count(DISTINCT s) FROM t;
+----
+physical_plan	<REGEX>:.*Column Data Scan.*
+
+query I
+SELECT count(DISTINCT s) FROM t;
+----
+3
+
+# a column that is not constant within its partitions
+query II
+EXPLAIN SELECT DISTINCT i, x FROM t;
+----
+physical_plan	<!REGEX>:.*Column Data Scan.*
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT i, x FROM t);
+----
+10240
+
+# floating point statistics are not used
+query II
+EXPLAIN SELECT DISTINCT f FROM t;
+----
+physical_plan	<!REGEX>:.*Column Data Scan.*
+
+query I
+SELECT DISTINCT f FROM t ORDER BY ALL;
+----
+0.0
+1.0
+2.0
+3.0
+4.0
+
+# volatile expressions see every row
+query II
+EXPLAIN SELECT DISTINCT i, random() < 2 FROM t;
+----
+physical_plan	<!REGEX>:.*Column Data Scan.*
+
+# aggregates see every row
+query II
+EXPLAIN SELECT i, count(*) FROM t GROUP BY i;
+----
+physical_plan	<!REGEX>:.*Column Data Scan.*
+
+query II
+SELECT i, count(*) FROM t GROUP BY i ORDER BY i;
+----
+0	4096
+1	4096
+2	2048
+
+# filters are not answered from the statistics
+query II
+EXPLAIN SELECT DISTINCT s FROM t WHERE x >= 2048;
+----
+physical_plan	<!REGEX>:.*Column Data Scan.*
+
+query I
+SELECT DISTINCT s FROM t WHERE x >= 4096 ORDER BY ALL;
+----
+m0
+m1
+m2
+
+query I
+SELECT DISTINCT s FROM t WHERE x >= 8192 ORDER BY ALL;
+----
+m1
+
+# DISTINCT ON is not rewritten
+query II
+SELECT DISTINCT ON (i) i, d FROM t ORDER BY i, d DESC;
+----
+0	2026-01-02
+1	2026-01-03
+2	2026-01-02
+
+# uncommitted changes
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO t VALUES (7, 'm7', DATE '2026-02-01', 0, 0);
+
+query I
+SELECT DISTINCT i FROM t ORDER BY ALL;
+----
+0
+1
+2
+7
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT DISTINCT i FROM t ORDER BY ALL;
+----
+0
+1
+2
+
+# a NULL within a partition
+statement ok
+UPDATE t SET s = NULL WHERE x = 5000;
+
+statement ok
+CHECKPOINT;
+
+query I
+SELECT DISTINCT s FROM t ORDER BY ALL;
+----
+m0
+m1
+m2
+NULL
+
+query I
+SELECT DISTINCT i FROM t ORDER BY ALL;
+----
+0
+1
+2
+
+# deleting part of a partition keeps its value, deleting all of it removes the value
+statement ok
+DELETE FROM t WHERE x >= 4096 AND x < 6000;
+
+query II
+SELECT DISTINCT i, d FROM t ORDER BY ALL;
+----
+0	2026-01-01
+0	2026-01-02
+1	2026-01-01
+1	2026-01-03
+2	2026-01-02
+
+statement ok
+DELETE FROM t WHERE x >= 6000 AND x < 6144;
+
+query II
+SELECT DISTINCT i, d FROM t ORDER BY ALL;
+----
+0	2026-01-01
+0	2026-01-02
+1	2026-01-01
+1	2026-01-03
+
+statement ok
+CHECKPOINT;
+
+query II
+SELECT DISTINCT i, d FROM t ORDER BY ALL;
+----
+0	2026-01-01
+0	2026-01-02
+1	2026-01-01
+1	2026-01-03
+
+# strings that do not fit in the statistics
+statement ok
+CREATE TABLE long_strings AS SELECT 'a long string value ' || (range // 2048) AS s FROM range(4096);
+
+statement ok
+CHECKPOINT;
+
+query I
+SELECT DISTINCT s FROM long_strings ORDER BY ALL;
+----
+a long string value 0
+a long string value 1
+
+# empty table
+statement ok
+CREATE TABLE empty_tbl (i INTEGER);
+
+query I
+SELECT DISTINCT i FROM empty_tbl;
+----
+
+# parquet row groups
+statement ok
+COPY (
+	SELECT (range // 2048 % 3)::INTEGER AS i, 'a long string value ' || (range // 2048 % 3) AS s, range AS x
+	FROM range(10240)
+) TO '{TEST_DIR}/distinct_constant_partitions.parquet' (ROW_GROUP_SIZE 2048);
+
+query II
+EXPLAIN SELECT DISTINCT i, s FROM '{TEST_DIR}/distinct_constant_partitions.parquet';
+----
+physical_plan	<REGEX>:.*Column Data Scan.*
+
+query II
+SELECT DISTINCT i, s FROM '{TEST_DIR}/distinct_constant_partitions.parquet' ORDER BY ALL;
+----
+0	a long string value 0
+1	a long string value 1
+2	a long string value 2
+
+query II
+EXPLAIN SELECT DISTINCT i, x FROM '{TEST_DIR}/distinct_constant_partitions.parquet';
+----
+physical_plan	<!REGEX>:.*Column Data Scan.*
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT i, x FROM '{TEST_DIR}/distinct_constant_partitions.parquet');
+----
+10240

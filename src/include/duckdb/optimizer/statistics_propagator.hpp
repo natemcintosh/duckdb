@@ -102,6 +102,7 @@ private:
 	unique_ptr<NodeStatistics> PropagateStatistics(LogicalSetOperation &op, unique_ptr<LogicalOperator> &node_ptr);
 	unique_ptr<NodeStatistics> PropagateStatistics(LogicalAggregate &op, unique_ptr<LogicalOperator> &node_ptr);
 	unique_ptr<NodeStatistics> PropagateStatistics(LogicalCrossProduct &op, unique_ptr<LogicalOperator> &node_ptr);
+	unique_ptr<NodeStatistics> PropagateStatistics(LogicalDistinct &op, unique_ptr<LogicalOperator> &node_ptr);
 	unique_ptr<NodeStatistics> PropagateStatistics(LogicalLimit &op, unique_ptr<LogicalOperator> &node_ptr);
 	unique_ptr<NodeStatistics> PropagateStatistics(LogicalOrder &op, unique_ptr<LogicalOperator> &node_ptr);
 	unique_ptr<NodeStatistics> PropagateStatistics(LogicalWindow &op, unique_ptr<LogicalOperator> &node_ptr);
@@ -175,6 +176,10 @@ private:
 
 	//! Try to execute aggregates using only the statistics if possible
 	void TryExecuteAggregates(LogicalAggregate &op, unique_ptr<LogicalOperator> &node_ptr);
+	//! Replace a scan whose duplicate rows are eliminated by one row per partition, if the statistics prove that all
+	//! rows of a partition are identical
+	void TryScanConstantPartitions(const vector<unique_ptr<Expression>> &distinct_expressions,
+	                               unique_ptr<LogicalOperator> &child);
 	void ReplaceWithEmptyResult(unique_ptr<LogicalOperator> &node);
 
 	bool ExpressionIsConstant(Expression &expr, const Value &val);
